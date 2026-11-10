@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name         ambz – Apple Music playlist search & sort
-// @namespace    ambz
+// @name         ambzv1 – Apple Music playlist search & sort
+// @namespace    ambzv1
 // @version      0.1.1
 // @description  Loads the complete track list of a playlist at once and adds search and sorting.
 // @match        https://music.apple.com/*

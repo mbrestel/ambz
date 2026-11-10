@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name         ambz – Apple Music playlist search & sort
-// @namespace    ambz
+// @name         ambzv2 – Apple Music playlist search & sort
+// @namespace    ambzv2
 // @version      0.2.2
 // @description  Replaces a playlist's song list with a complete one (no lazy loading) and adds search and sorting to the playlist header.
 // @match        https://music.apple.com/*
