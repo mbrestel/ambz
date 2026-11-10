@@ -1,11 +1,17 @@
 // ==UserScript==
-// @name         ambzv2 – Apple Music playlist search & sort
-// @namespace    ambzv2
-// @version      0.2.2
-// @description  Replaces a playlist's song list with a complete one (no lazy loading) and adds search and sorting to the playlist header.
+// @name         ambzv6 – Apple Music playlist search & sort
+// @namespace    ambzv6
+// @version      0.4.0
+// @description  Replaces a playlist's song list with a complete one (no lazy loading) and adds search, sorting, links and a song menu.
 // @match        https://music.apple.com/*
 // @match        https://beta.music.apple.com/*
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_setClipboard
+// @connect      accounts.spotify.com
+// @connect      api.spotify.com
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -44,6 +50,17 @@
         pos: 'Playlist-Reihenfolge', title: 'Titel', artist: 'Künstler:in', album: 'Album', dur: 'Dauer',
         release: 'Erscheinungsdatum', added: 'Hinzugefügt am', asc: 'Aufsteigend', desc: 'Absteigend',
         native: 'Originalliste anzeigen', reload: 'Neu laden', none: 'Keine passenden Titel',
+        more: 'Mehr', back: 'Zurück', playNext: 'Als Nächstes abspielen', playLast: 'Zuletzt abspielen',
+        addToPlaylist: 'Zu Playlist hinzufügen', addToLibrary: 'Zur Mediathek hinzufügen', favorite: 'Als Favorit markieren',
+        goSong: 'Titel anzeigen', goAlbum: 'Album anzeigen', goArtist: 'Künstler:in anzeigen', copyLink: 'Link kopieren',
+        queuedNext: 'Wird als Nächstes gespielt', queuedLast: 'Wird zuletzt gespielt', addedLibrary: 'Zur Mediathek hinzugefügt',
+        favorited: 'Als Favorit markiert', copied: 'Link kopiert', failed: 'Fehlgeschlagen', unavailable: 'Nicht verfügbar',
+        remove: 'Aus Playlist entfernen', removed: 'Aus Playlist entfernt', copySpotify: 'Spotify-Link kopieren',
+        copiedSpotify: 'Spotify-Link kopiert', spotifyFallback: 'Bei Spotify nicht gefunden – Suchlink kopiert',
+        badSpotifyLogin: 'Spotify-Zugangsdaten ungültig, bitte erneut eingeben',
+        askSpotifyId: 'Spotify Client ID\n(developer.spotify.com/dashboard → deine App → Settings)',
+        askSpotifySecret: 'Spotify Client Secret',
+        noPlaylists: 'Keine bearbeitbaren Playlists', addedTo: (name) => `Zu „${name}“ hinzugefügt`,
         count: (n, total) => `${n} von ${total} Titeln`,
         progress: (done, total) => (total ? `Lade ${done} / ${total} …` : `Lade ${done} …`),
       }
@@ -52,6 +69,17 @@
         pos: 'Playlist order', title: 'Song', artist: 'Artist', album: 'Album', dur: 'Time',
         release: 'Release date', added: 'Date added', asc: 'Ascending', desc: 'Descending',
         native: 'Show original list', reload: 'Reload', none: 'No matching songs',
+        more: 'More', back: 'Back', playNext: 'Play Next', playLast: 'Play Last',
+        addToPlaylist: 'Add to Playlist', addToLibrary: 'Add to Library', favorite: 'Mark as Favorite',
+        goSong: 'Go to Song', goAlbum: 'Go to Album', goArtist: 'Go to Artist', copyLink: 'Copy Link',
+        queuedNext: 'Playing next', queuedLast: 'Playing last', addedLibrary: 'Added to library',
+        favorited: 'Marked as favorite', copied: 'Link copied', failed: 'Failed', unavailable: 'Not available',
+        remove: 'Remove from Playlist', removed: 'Removed from playlist', copySpotify: 'Copy Spotify Link',
+        copiedSpotify: 'Spotify link copied', spotifyFallback: 'Not found on Spotify – search link copied',
+        badSpotifyLogin: 'Spotify credentials invalid, please enter them again',
+        askSpotifyId: 'Spotify Client ID\n(developer.spotify.com/dashboard → your app → Settings)',
+        askSpotifySecret: 'Spotify Client Secret',
+        noPlaylists: 'No editable playlists', addedTo: (name) => `Added to “${name}”`,
         count: (n, total) => `${n} of ${total} songs`,
         progress: (done, total) => (total ? `Loading ${done} / ${total}…` : `Loading ${done}…`),
       };
@@ -83,10 +111,19 @@
     }
   }
 
-  async function apiGet(path) {
+  async function apiGet(path, params) {
     const mk = await waitForMK();
-    const res = await mk.api.music(path);
+    const res = params ? await mk.api.music(path, toPage(params)) : await mk.api.music(path);
     return fromPage(res.data);
+  }
+
+  // Write requests. MusicKit JSON-encodes an object body itself.
+  async function apiSend(method, path, params, body) {
+    const mk = await waitForMK();
+    const options = body === undefined ? { method } : { method, body };
+    const res = await mk.api.music(path, toPage(params || {}), toPage(options));
+    const status = Number(res && res.status);
+    if (!(status >= 200 && status < 300)) throw new Error(`HTTP ${status || '?'}`);
   }
 
   // ---------------------------------------------------------------- data
@@ -107,8 +144,14 @@
     const art = a.artwork && a.artwork.url
       ? a.artwork.url.replace('{w}', '80').replace('{h}', '80').replace('{f}', 'jpg')
       : '';
+    const id = String((pp && pp.id) || item.id);
+    const library = id.startsWith('i.');
     return {
-      id: String((pp && pp.id) || item.id),
+      id,
+      library,                                                        // lives in the user's library
+      type: item.type || (library ? 'library-songs' : 'songs'),       // API resource type
+      links: null,                                                    // song/album/artist pages, looked up on demand
+      spotify: '',                                                    // Spotify address once found
       catalogId: pp && pp.catalogId ? String(pp.catalogId) : null,
       playable: !!pp,
       pos,
@@ -267,6 +310,20 @@
     .ambz-menu .ambz-item:hover, .ambz-menu .ambz-item:focus-visible { background: rgba(128,128,128,.2); }
     .ambz-menu .ambz-check { flex: none; width: 14px; color: var(--musicKeyColor, #fa2d48); }
     .ambz-menu .ambz-sep { height: 1px; margin: 5px 8px; background: rgba(128,128,128,.3); }
+    .ambz-menu { max-width: 340px; max-height: min(70vh, 560px); overflow-y: auto; }
+    .ambz-menu .ambz-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ambz-menu .ambz-note { padding: 7px 10px; opacity: .6; }
+
+    /* ---- short confirmation after a song action ---- */
+    .ambz-toast {
+      position: fixed; z-index: 2147483001; left: 50%; bottom: 96px; transform: translate(-50%, 8px);
+      box-sizing: border-box; max-width: min(80vw, 440px); padding: 9px 16px; border-radius: 18px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      background: #1d1d1f; color: #fff; font-size: 13px; line-height: 1.25; box-shadow: 0 6px 24px rgba(0,0,0,.3);
+      opacity: 0; pointer-events: none; transition: opacity .18s ease, transform .18s ease;
+    }
+    .ambz-toast.ambz-dark { background: #f5f5f7; color: #1d1d1f; }
+    .ambz-toast.ambz-show { opacity: 1; transform: translate(-50%, 0); }
 
     /* ---- song list ---- */
     .ambz-list {
@@ -347,13 +404,23 @@
       min-width: 0; padding-inline-end: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       font: var(--body, 13px/16px system-ui, sans-serif);
     }
+    /* duration, then the "…" button where Apple's list has its own */
     .ambz-dur {
-      padding-inline-end: var(--ambz-dur-end, 53px); text-align: end; font: var(--body, 13px/16px system-ui, sans-serif);
-      font-variant-numeric: tabular-nums;
+      display: flex; align-items: center; justify-content: flex-end;
+      gap: max(4px, calc(var(--ambz-dur-end, 53px) - 46px)); padding-inline-end: 18px;
+      font: var(--body, 13px/16px system-ui, sans-serif); font-variant-numeric: tabular-nums;
     }
+    .ambz-list .ambz-more {
+      all: unset; box-sizing: border-box; flex: none; width: 28px; height: 28px; padding: 0 6.5px; cursor: pointer;
+      color: var(--systemPrimary, inherit); opacity: .8;
+      background: radial-gradient(circle, currentColor 1.4px, transparent 1.9px) 0 50% / 5px 5px repeat-x content-box content-box;
+    }
+    .ambz-list .ambz-more:hover, .ambz-list .ambz-more:focus-visible { opacity: 1; }
+    .ambz-link { cursor: pointer; }
+    .ambz-link:hover { text-decoration: underline; }
+    .ambz-link.ambz-busy { cursor: progress; }
     @media (max-width: 900px) {
-      .ambz-head, .ambz-row { grid-template-columns: minmax(0, 58fr) minmax(0, 42fr) 76px; }
-      .ambz-list { --ambz-dur-end: 18px; }
+      .ambz-head, .ambz-row { grid-template-columns: minmax(0, 58fr) minmax(0, 42fr) 104px; }
       .ambz-head > :nth-child(3), .ambz-row > :nth-child(3) { display: none; }
     }
   `;
@@ -435,7 +502,10 @@
       clearTimeout(debounce);
       debounce = setTimeout(() => setQuery(search.value), 120);
     });
-    sortBtn.addEventListener('click', () => (ui.menu ? closeMenu() : openMenu()));
+    sortBtn.addEventListener('click', () => {
+      if (ui.menu && ui.menuAnchor && ui.menuAnchor.el === sortBtn) closeMenu();
+      else showMenu({ el: sortBtn }, sortItems());
+    });
 
     // -- list
     const headCols = HEAD_COLS.map((key) =>
@@ -449,19 +519,43 @@
     const body = h('div', { class: 'ambz-body' });
     const root = h('div', { class: 'ambz-list' }, info, head, body);
 
+    const rowOf = (e) => (e.target.closest ? e.target.closest('.ambz-row') : null);
     body.addEventListener('click', (e) => {
-      const row = e.target.closest && e.target.closest('.ambz-row');
+      const justClosed = ui.justClosed;
+      ui.justClosed = null;
+      const row = rowOf(e);
       if (!row) return;
       const i = Number(row.dataset.i);
-      if (e.target.closest('.ambz-art')) playOrToggle(i);
-      else select(row);
+      const more = e.target.closest('.ambz-more');
+      const link = e.target.closest('.ambz-link');
+      if (more) {
+        select(row);
+        if (justClosed !== more) showTrackMenu(i, { el: more }); // second click on "…" closes its menu
+      } else if (link) {
+        go(state.view[i], link.dataset.go, { x: e.clientX, y: e.clientY }, link);
+      } else if (e.target.closest('.ambz-art')) {
+        playOrToggle(i);
+      } else {
+        select(row);
+      }
     });
     body.addEventListener('dblclick', (e) => {
-      const row = e.target.closest && e.target.closest('.ambz-row');
-      if (row && !e.target.closest('.ambz-art')) play(Number(row.dataset.i));
+      const row = rowOf(e);
+      if (row && !e.target.closest('.ambz-art, .ambz-link, .ambz-more')) play(Number(row.dataset.i));
+    });
+    body.addEventListener('contextmenu', (e) => {
+      const row = rowOf(e);
+      if (!row) return;
+      e.preventDefault();
+      select(row);
+      showTrackMenu(Number(row.dataset.i), { x: e.clientX, y: e.clientY });
     });
 
-    ui = { search, searchBox, sortBtn, actions, info, head, headCols, body, root, menu: null };
+    const toastEl = h('div', { class: 'ambz-toast', role: 'status' });
+    ui = {
+      search, searchBox, sortBtn, actions, info, head, headCols, body, root,
+      menu: null, menuAnchor: null, justClosed: null, toast: toastEl,
+    };
   }
 
   function setQuery(q) {
@@ -493,7 +587,7 @@
     if (row) row.classList.add('ambz-sel');
   }
 
-  // ---- sort menu
+  // ---- menus (sort menu and song menu) and the confirmation toast
   function isDark() {
     const el = document.getElementById('scrollable-page') || document.body;
     const color = getComputedStyle(el).color;
@@ -502,59 +596,105 @@
     return 0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2] > 140; // light text means dark page
   }
 
-  function openMenu() {
-    closeMenu();
-    const menu = h('div', { class: isDark() ? 'ambz-menu ambz-dark' : 'ambz-menu', role: 'menu' });
-    const item = (label, checked, fn) =>
-      h('button', {
-        class: 'ambz-item', type: 'button', role: 'menuitemcheckbox', 'aria-checked': String(!!checked),
-        onclick: () => {
-          closeMenu();
-          fn();
-        },
-      }, h('span', { class: 'ambz-check' }, checked ? '✓' : ''), label);
-    const sep = () => h('div', { class: 'ambz-sep' });
-
-    for (const key of SORT_KEYS) {
-      // Offer the date sorts only when the playlist actually carries those dates.
-      if ((key === 'release' || key === 'added') && !state.tracks.some((t) => t[key])) continue;
-      menu.append(item(T[key], settings.sort === key, () => setSort(key, settings.desc)));
+  // items: null = separator, { note } = plain text, { label, checked, keep, run } = entry.
+  // "keep" leaves the menu open (the entry swaps the menu's content).
+  function fillMenu(menu, items) {
+    menu.textContent = '';
+    for (const it of items) {
+      if (!it) {
+        menu.append(h('div', { class: 'ambz-sep' }));
+      } else if (it.note) {
+        menu.append(h('div', { class: 'ambz-note' }, it.note));
+      } else {
+        menu.append(h('button', {
+          class: 'ambz-item', type: 'button', role: 'menuitem',
+          onclick: () => {
+            if (!it.keep) closeMenu();
+            it.run();
+          },
+        }, h('span', { class: 'ambz-check' }, it.checked ? '✓' : ''), h('span', { class: 'ambz-label' }, it.label)));
+      }
     }
-    menu.append(
-      sep(),
-      item(T.asc, !settings.desc, () => setSort(settings.sort, false)),
-      item(T.desc, settings.desc, () => setSort(settings.sort, true)),
-      sep(),
-      item(T.native, state.showNative, () => {
-        state.showNative = !state.showNative;
-        sync();
-      }),
-      item(T.reload, false, () => {
-        if (state.pl) {
-          cache.delete(state.pl.id);
-          load(state.pl);
-        }
-      })
-    );
+  }
 
-    document.body.append(menu);
-    const r = ui.sortBtn.getBoundingClientRect();
+  // anchor: { el } opens below that element, { x, y } opens at that point.
+  function placeMenu() {
+    const menu = ui.menu;
+    const a = ui.menuAnchor;
+    if (!menu || !a) return;
+    if (a.el && a.el.isConnected) a.rect = a.el.getBoundingClientRect();
+    const r = a.rect || { left: a.x || 0, right: a.x || 0, top: a.y || 0, bottom: a.y || 0 };
+    const gap = a.el ? 6 : 2;
     const mw = menu.offsetWidth;
     const mh = menu.offsetHeight;
     const left = Math.max(8, Math.min(r.left, window.innerWidth - mw - 8));
-    const below = r.bottom + 6;
-    const top = below + mh > window.innerHeight - 8 ? Math.max(8, r.top - mh - 6) : below;
+    const below = r.bottom + gap;
+    const top = below + mh > window.innerHeight - 8 ? Math.max(8, r.top - mh - gap) : below;
     menu.style.left = `${left}px`;
     menu.style.top = `${top}px`;
+  }
+
+  function showMenu(anchor, items) {
+    closeMenu();
+    const menu = h('div', { class: isDark() ? 'ambz-menu ambz-dark' : 'ambz-menu', role: 'menu' });
+    fillMenu(menu, items);
+    document.body.append(menu);
     ui.menu = menu;
-    ui.sortBtn.setAttribute('aria-expanded', 'true');
+    ui.menuAnchor = anchor;
+    placeMenu();
+    if (anchor.el === ui.sortBtn) ui.sortBtn.setAttribute('aria-expanded', 'true');
   }
 
   function closeMenu() {
     if (!ui || !ui.menu) return;
     ui.menu.remove();
     ui.menu = null;
+    ui.menuAnchor = null;
     ui.sortBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function sortItems() {
+    const items = [];
+    for (const key of SORT_KEYS) {
+      // Offer the date sorts only when the playlist actually carries those dates.
+      if ((key === 'release' || key === 'added') && !state.tracks.some((t) => t[key])) continue;
+      items.push({ label: T[key], checked: settings.sort === key, run: () => setSort(key, settings.desc) });
+    }
+    items.push(
+      null,
+      { label: T.asc, checked: !settings.desc, run: () => setSort(settings.sort, false) },
+      { label: T.desc, checked: settings.desc, run: () => setSort(settings.sort, true) },
+      null,
+      {
+        label: T.native, checked: state.showNative,
+        run: () => {
+          state.showNative = !state.showNative;
+          sync();
+        },
+      },
+      {
+        label: T.reload,
+        run: () => {
+          if (state.pl) {
+            cache.delete(state.pl.id);
+            load(state.pl);
+          }
+        },
+      }
+    );
+    return items;
+  }
+
+  let toastTimer = 0;
+  function toast(text) {
+    const el = ui.toast;
+    el.textContent = text;
+    el.className = isDark() ? 'ambz-toast ambz-dark' : 'ambz-toast';
+    if (!el.isConnected) document.body.append(el);
+    void el.offsetWidth; // let the hidden state apply first so the fade-in runs
+    el.classList.add('ambz-show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('ambz-show'), 2400);
   }
 
   // ---- rendering
@@ -611,10 +751,16 @@
         h('div', { class: 'ambz-song' },
           h('div', { class: 'ambz-art' },
             t.art ? h('img', { src: t.art, loading: 'lazy', decoding: 'async', alt: '' }) : null),
-          h('div', { class: 'ambz-title', title: t.title }, t.title, t.explicit ? h('span', { class: 'ambz-e' }, 'E') : null)),
-        h('div', { class: 'ambz-cell', title: t.artist }, t.artist),
-        h('div', { class: 'ambz-cell', title: t.album }, t.album),
-        h('div', { class: 'ambz-dur' }, fmtDur(t.dur))
+          h('div', { class: 'ambz-title', title: t.title },
+            catalogIdOf(t) ? h('span', { class: 'ambz-link', 'data-go': 'song' }, t.title) : t.title,
+            t.explicit ? h('span', { class: 'ambz-e' }, 'E') : null)),
+        h('div', { class: 'ambz-cell', title: t.artist },
+          t.artist ? h('span', { class: 'ambz-link', 'data-go': 'artist' }, t.artist) : null),
+        h('div', { class: 'ambz-cell', title: t.album },
+          t.album ? h('span', { class: 'ambz-link', 'data-go': 'album' }, t.album) : null),
+        h('div', { class: 'ambz-dur' },
+          h('span', null, fmtDur(t.dur)),
+          h('button', { class: 'ambz-more', type: 'button', title: T.more, 'aria-label': T.more }))
       );
       state.rows.push(row);
       frag.append(row);
@@ -681,6 +827,351 @@
       return String((e && (e.message || e.name)) || e);
     } catch (x) {
       return 'unknown error';
+    }
+  }
+
+  // ---------------------------------------------------------------- links (song, album, artist pages)
+  const catalogIdOf = (t) => t.catalogId || (t.library ? null : t.id);
+  const kindOf = (t) => t.type.replace('library-', ''); // songs | music-videos
+
+  function storefront() {
+    const mk = getMK();
+    return (state.pl && state.pl.storefront) || (mk && mk.storefrontId) || 'us';
+  }
+
+  // Moves to another page inside Apple Music's own app. Following a normal link
+  // would reload the whole page and stop playback.
+  function navigate(url) {
+    let u;
+    try {
+      u = new URL(url, location.href);
+    } catch (e) {
+      return;
+    }
+    closeMenu();
+    if (!/(^|\.)music\.apple\.com$/.test(u.hostname)) {
+      window.open(u.href, '_blank', 'noopener');
+      return;
+    }
+    W.history.pushState(null, '', u.pathname + u.search);
+    W.dispatchEvent(new W.PopStateEvent('popstate'));
+  }
+
+  const related = (item, name) =>
+    (item.relationships && item.relationships[name] && item.relationships[name].data) || [];
+  const attrs = (item) => item.attributes || {};
+
+  async function fetchLinks(t) {
+    const sf = storefront();
+    const cid = catalogIdOf(t);
+    if (cid) {
+      const r = await apiGet(`/v1/catalog/${sf}/${kindOf(t)}/${cid}`, {
+        include: 'artists,albums', 'fields[artists]': 'name,url', 'fields[albums]': 'name,url',
+      });
+      const item = r.data && r.data[0];
+      if (!item) throw new Error('not found in the catalog');
+      return {
+        song: attrs(item).url || '',
+        isrc: attrs(item).isrc || '', // recording code shared across music services
+        album: related(item, 'albums').map((a) => attrs(a).url).find(Boolean) || '',
+        artists: related(item, 'artists')
+          .map((a) => ({ name: attrs(a).name || t.artist, url: attrs(a).url }))
+          .filter((a) => a.url),
+      };
+    }
+    // Not in the catalog (an uploaded song, for example): use its library pages.
+    const r = await apiGet(`/v1/me/library/${kindOf(t)}/${t.id}`, { include: 'artists,albums' });
+    const item = r.data && r.data[0];
+    if (!item) throw new Error('not found in the library');
+    return {
+      song: '',
+      isrc: '',
+      album: related(item, 'albums').map((a) => `/${sf}/library/albums/${a.id}`)[0] || '',
+      artists: related(item, 'artists')
+        .map((a) => ({ name: attrs(a).name || t.artist, url: `/${sf}/library/artists/${a.id}` })),
+    };
+  }
+
+  // One lookup per song, on first use; a failed lookup may be retried.
+  function resolveLinks(t) {
+    if (!t.links) {
+      t.links = fetchLinks(t);
+      t.links.catch(() => {
+        t.links = null;
+      });
+    }
+    return t.links;
+  }
+
+  // what: 'song' | 'album' | 'artist'. Several artists open a small chooser at the anchor.
+  async function go(t, what, anchor, el) {
+    if (!t) return;
+    const cid = catalogIdOf(t);
+    if (what === 'song' && cid) {
+      // The song page address only needs the catalogue id, so no lookup is required.
+      navigate(`/${storefront()}/${kindOf(t) === 'music-videos' ? 'music-video' : 'song'}/${cid}`);
+      return;
+    }
+    const pl = state.pl;
+    if (el) el.classList.add('ambz-busy');
+    let links;
+    try {
+      links = await resolveLinks(t);
+    } catch (e) {
+      console.error('[ambz] link lookup failed', e);
+      toast(T.unavailable);
+      return;
+    } finally {
+      if (el) el.classList.remove('ambz-busy');
+    }
+    if (state.pl !== pl) return; // the user moved on while we were looking it up
+    if (what === 'artist') {
+      if (links.artists.length > 1) {
+        showMenu(anchor, links.artists.map((a) => ({ label: a.name, run: () => navigate(a.url) })));
+      } else if (links.artists.length) {
+        navigate(links.artists[0].url);
+      } else {
+        toast(T.unavailable);
+      }
+      return;
+    }
+    const url = what === 'album' ? links.album : links.song;
+    if (url) navigate(url);
+    else toast(T.unavailable);
+  }
+
+  // ---------------------------------------------------------------- song menu actions
+  async function act(doneText, fn) {
+    try {
+      await fn();
+      toast(doneText);
+    } catch (e) {
+      console.error('[ambz] action failed', e);
+      toast(`${T.failed} (${errText(e)})`);
+    }
+  }
+
+  const enqueue = (t, next) =>
+    act(next ? T.queuedNext : T.queuedLast, async () => {
+      const mk = await waitForMK();
+      const what = toPage(kindOf(t) === 'music-videos' ? { musicVideo: t.id } : { song: t.id });
+      if (next) await mk.playNext(what);
+      else await mk.playLater(what);
+    });
+
+  // The three write requests below use the same paths and bodies as Apple Music's own web app.
+  const addToPlaylist = (t, p) =>
+    act(T.addedTo(p.name), () =>
+      apiSend('POST', `/v1/me/library/playlists/${p.id}/tracks`, { representation: 'resources' },
+        { data: [{ id: t.id, type: t.type }] }));
+
+  const addToLibrary = (t) =>
+    act(T.addedLibrary, () =>
+      apiSend('POST', '/v1/me/library', { [`ids[${kindOf(t)}]`]: catalogIdOf(t), representation: 'ids' }));
+
+  const favorite = (t) =>
+    act(T.favorited, () =>
+      apiSend('PUT', `/v1/me/ratings/${t.type}/${t.id}`, null, { type: 'rating', attributes: { value: 1 } }));
+
+  // Same request Apple Music's web app sends. "mode=all" removes every occurrence
+  // of the song from the playlist, so the local list drops them all as well.
+  const removeFromPlaylist = (t) => {
+    const pl = state.pl;
+    return act(T.removed, async () => {
+      await apiSend('DELETE', `/v1/me/library/playlists/${pl.id}/tracks`, { [`ids[${t.type}]`]: t.id, mode: 'all' });
+      const rest = (cache.get(pl.id) || []).filter((x) => x.id !== t.id);
+      rest.forEach((x, i) => {
+        x.pos = i;
+      });
+      cache.set(pl.id, rest);
+      if (state.pl === pl) {
+        state.tracks = rest;
+        render();
+        sync();
+      }
+    });
+  };
+
+  const copyLink = (t) =>
+    act(T.copied, async () => {
+      const links = await resolveLinks(t);
+      if (!links.song) throw new Error('no link');
+      await copyText(links.song);
+    });
+
+  // ---------------------------------------------------------------- Spotify link
+  // Finds the same recording on Spotify through Spotify's Web API, matching on the
+  // ISRC that Apple Music reports for the song. Needs a (free) Spotify developer
+  // app; its client ID and secret are asked for once and kept in the userscript
+  // manager's storage, not in the page.
+  const stored = (key) => (typeof GM_getValue === 'function' ? GM_getValue(key, '') : '');
+  const store = (key, value) => {
+    if (typeof GM_setValue === 'function') GM_setValue(key, value);
+  };
+
+  // Cross-site request through the userscript manager (the page itself may only talk to Apple).
+  function gmRequest(options) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        reject(new Error('GM_xmlhttpRequest not available'));
+        return;
+      }
+      GM_xmlhttpRequest(Object.assign({ method: 'GET', timeout: 15000 }, options, {
+        onload: resolve,
+        onerror: () => reject(new Error('network error')),
+        ontimeout: () => reject(new Error('timeout')),
+      }));
+    });
+  }
+
+  // Works after a network round trip too, when the browser no longer counts the click.
+  async function copyText(text) {
+    if (typeof GM_setClipboard === 'function') GM_setClipboard(text, 'text');
+    else await navigator.clipboard.writeText(text);
+  }
+
+  function spotifyCredentials() {
+    let id = stored('spotifyClientId');
+    let secret = stored('spotifyClientSecret');
+    if (id && secret) return { id, secret };
+    id = (window.prompt(T.askSpotifyId) || '').trim();
+    if (!id) return null;
+    secret = (window.prompt(T.askSpotifySecret) || '').trim();
+    if (!secret) return null;
+    store('spotifyClientId', id);
+    store('spotifyClientSecret', secret);
+    return { id, secret };
+  }
+
+  let spotifyToken = null; // { value, until }
+  async function getSpotifyToken() {
+    if (spotifyToken && Date.now() < spotifyToken.until) return spotifyToken.value;
+    const cred = spotifyCredentials();
+    if (!cred) return null; // the user cancelled the prompt
+    const r = await gmRequest({
+      method: 'POST',
+      url: 'https://accounts.spotify.com/api/token',
+      headers: {
+        Authorization: `Basic ${btoa(`${cred.id}:${cred.secret}`)}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      data: 'grant_type=client_credentials',
+    });
+    if (r.status === 400 || r.status === 401) {
+      // Wrong ID or secret: forget them so the next attempt asks again.
+      store('spotifyClientId', '');
+      store('spotifyClientSecret', '');
+      throw new Error(T.badSpotifyLogin);
+    }
+    if (r.status !== 200) throw new Error(`Spotify HTTP ${r.status}`);
+    const json = JSON.parse(r.responseText);
+    spotifyToken = { value: json.access_token, until: Date.now() + (Number(json.expires_in) - 60) * 1000 };
+    return spotifyToken.value;
+  }
+
+  async function copySpotify(t) {
+    // Used when the exact track cannot be determined: opens Spotify's search for "title artist".
+    const searchLink = `https://open.spotify.com/search/${encodeURIComponent(`${t.title} ${t.artist}`.trim())}`;
+    try {
+      if (!t.spotify) {
+        const isrc = catalogIdOf(t) ? (await resolveLinks(t)).isrc : '';
+        if (isrc) {
+          const token = await getSpotifyToken();
+          if (!token) return;
+          const r = await gmRequest({
+            url: `https://api.spotify.com/v1/search?q=${encodeURIComponent(`isrc:${isrc}`)}&type=track&limit=1`,
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (r.status === 401) spotifyToken = null;
+          if (r.status !== 200) throw new Error(`Spotify HTTP ${r.status}`);
+          const tracks = JSON.parse(r.responseText).tracks;
+          const hit = tracks && tracks.items && tracks.items[0];
+          t.spotify = (hit && hit.external_urls && hit.external_urls.spotify) || '';
+        }
+      }
+      await copyText(t.spotify || searchLink);
+      toast(t.spotify ? T.copiedSpotify : T.spotifyFallback);
+    } catch (e) {
+      console.error('[ambz] Spotify lookup failed', e);
+      toast(`${T.failed} (${errText(e)})`);
+    }
+  }
+
+  // The user's own (editable) playlists, cached for two minutes.
+  let playlistCache = null;
+  async function loadPlaylists() {
+    if (playlistCache && Date.now() - playlistCache.at < 120000) return playlistCache.list;
+    const list = [];
+    let offset = 0;
+    for (;;) {
+      const r = await apiGet('/v1/me/library/playlists', { limit: 100, offset });
+      const data = r.data || [];
+      for (const p of data) {
+        if (attrs(p).canEdit) list.push({ id: p.id, name: attrs(p).name || p.id });
+      }
+      offset += data.length;
+      if (!r.next || !data.length) break;
+    }
+    list.sort((a, b) => collator.compare(a.name, b.name));
+    playlistCache = { at: Date.now(), list };
+    return list;
+  }
+
+  function trackItems(t, anchor) {
+    const cid = catalogIdOf(t);
+    const items = [
+      { label: T.playNext, run: () => enqueue(t, true) },
+      { label: T.playLast, run: () => enqueue(t, false) },
+      null,
+      { label: `${T.addToPlaylist} …`, keep: true, run: () => pickPlaylist(t, anchor) },
+    ];
+    if (cid && !t.library) items.push({ label: T.addToLibrary, run: () => addToLibrary(t) });
+    items.push({ label: T.favorite, run: () => favorite(t) }, null);
+    if (cid) items.push({ label: T.goSong, run: () => go(t, 'song', anchor) });
+    items.push(
+      { label: T.goAlbum, run: () => go(t, 'album', anchor) },
+      { label: T.goArtist, run: () => go(t, 'artist', anchor) }
+    );
+    items.push(null);
+    if (cid) items.push({ label: T.copyLink, run: () => copyLink(t) });
+    items.push({ label: T.copySpotify, run: () => copySpotify(t) });
+    // Only your own library playlists can have songs removed.
+    if (state.pl && state.pl.library && t.library) {
+      items.push(null, { label: T.remove, run: () => removeFromPlaylist(t) });
+    }
+    return items;
+  }
+
+  function showTrackMenu(i, anchor) {
+    const t = state.view[i];
+    if (t) showMenu(anchor, trackItems(t, anchor));
+  }
+
+  // Swaps the open song menu's content for the list of playlists.
+  async function pickPlaylist(t, anchor) {
+    const menu = ui.menu;
+    if (!menu) return;
+    const back = {
+      label: `‹ ${T.back}`, keep: true,
+      run: () => {
+        fillMenu(menu, trackItems(t, anchor));
+        placeMenu();
+      },
+    };
+    const show = (rest) => {
+      if (ui.menu !== menu) return; // closed in the meantime
+      fillMenu(menu, [back, null, ...rest]);
+      placeMenu();
+    };
+    show([{ note: T.loading }]);
+    try {
+      const lists = (await loadPlaylists()).filter((p) => !state.pl || p.id !== state.pl.id);
+      show(lists.length
+        ? lists.map((p) => ({ label: p.name, run: () => addToPlaylist(t, p) }))
+        : [{ note: T.noPlaylists }]);
+    } catch (e) {
+      console.error('[ambz] could not load playlists', e);
+      show([{ note: `${T.failed} (${errText(e)})` }]);
     }
   }
 
@@ -874,10 +1365,17 @@
       }
     }, true);
     document.addEventListener('mousedown', (e) => {
-      if (ui.menu && !ui.menu.contains(e.target) && !ui.sortBtn.contains(e.target)) closeMenu();
+      if (!ui.menu || ui.menu.contains(e.target) || ui.sortBtn.contains(e.target)) return;
+      const a = ui.menuAnchor;
+      ui.justClosed = a && a.el && a.el.contains(e.target) ? a.el : null;
+      closeMenu();
     }, true);
     window.addEventListener('resize', closeMenu);
-    document.addEventListener('scroll', closeMenu, true);
+    document.addEventListener('scroll', (e) => {
+      // Scrolling the page closes a menu; scrolling inside a long menu must not.
+      if (ui.menu && e.target instanceof Node && ui.menu.contains(e.target)) return;
+      closeMenu();
+    }, true);
 
     // Apple Music is a single-page app that re-renders freely, so re-check our
     // placement whenever the page changes, plus on a slow timer as a safety net.
